@@ -6,7 +6,7 @@ from .sublayers import SelfAttentionLayer, CrossAttentionLayer, SwiGLU, FeedForw
 from .decoder_layers import CrossAttentionDecoderLayer
 from .encoder_layers import SelfAttentionEncoderLayer
 from .speech_embedding import SpeechEmbedding, Conv2DSubsampling, ConvolutionalEmbedding
-from .transformers import EncoderDecoderTransformer
+from .transformers import EncoderDecoderTransformer, SpeechTransformer
 
 __all__ = [
     'PadMask',
@@ -26,4 +26,5 @@ __all__ = [
     'Conv2DSubsampling',
     'ConvolutionalEmbedding',
     'EncoderDecoderTransformer',
+    'SpeechTransformer'
 ]

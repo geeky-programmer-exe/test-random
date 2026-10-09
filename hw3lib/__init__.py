@@ -21,6 +21,7 @@ from .model import (
     Conv2DSubsampling,
     ConvolutionalEmbedding,
     EncoderDecoderTransformer,
+    SpeechTransformer
 )
 
 from .data import (
@@ -54,6 +55,7 @@ __all__ = [
     'Conv2DSubsampling',
     'ConvolutionalEmbedding',
     'EncoderDecoderTransformer',
+    'SpeechTransformer',
     # Data components
     'H3Tokenizer',
     'TextTokenizer',

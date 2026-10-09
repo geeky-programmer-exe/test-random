@@ -1,7 +1,9 @@
+import os
 from typing import Dict, Any, Optional, Tuple, List
 from tqdm import tqdm
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 
@@ -9,16 +11,18 @@ from ..data.tokenizer import H3Tokenizer
 from ..decoding.sequence_generator import SequenceGenerator
 from .base_trainer import BaseTrainer, AverageMeter
 
-'''
-TODO: Implement key methods of the `ASRTrainer` class in Flax NNX.
+try:
+    import jiwer
+    HAS_JIWER = True
+except ImportError:
+    HAS_JIWER = False
 
-This trainer implements:
-1. Training loop with joint CTC and Cross-Entropy loss via nnx.value_and_grad
-2. Validation loop for evaluation
-3. Speech recognition (greedy and beam search decoding)
-'''
 
 class ASRTrainer(BaseTrainer):
+    """
+    ASR Trainer managing training, validation, and speech transcription in JAX.
+    Supports both PyTorch-style and JAX functional training loop configurations.
+    """
     def __init__(
         self,
         arg1: Optional[Any] = None,
@@ -68,34 +72,43 @@ class ASRTrainer(BaseTrainer):
         """
         Compute joint CTC and Cross-Entropy loss.
         """
-        raise NotImplementedError  # Remove once implemented
-
         # TODO: Unpack features, shifted targets, golden targets, and lengths from the batch
-        feats = NotImplementedError
-        shifted = NotImplementedError
-        feat_lens = NotImplementedError
-        text_lens = NotImplementedError
-        golden = NotImplementedError
+        feats = batch.get('spectrogram', batch.get('features'))
+        shifted = batch.get('t_shifted', batch.get('shifted'))
+        feat_lens = batch.get('spectrogram_lengths', batch.get('feature_lengths'))
+        text_lens = batch.get('transcript_lengths', batch.get('text_lengths'))
+        golden = batch.get('t_golden', batch.get('golden'))
 
         # TODO: Run the model to get decoder logits and CTC logits
-        model_logits, ctc_logits, _ = NotImplementedError, NotImplementedError, NotImplementedError
+        model_logits, ctc_logits, _ = model(
+            feats, shifted,
+            input_lengths=feat_lens,
+            target_lengths=text_lens,
+            return_ctc=True
+        )
 
         # TODO: Build padding masks (0 on valid positions, 1 on pad) for the transcript and, for CTC, the frames
-        transcript_paddings = NotImplementedError
-
+        transcript_paddings = self.create_loss_pad_mask(golden, text_lens)
+        
         # TODO: Cross-entropy with optax.losses.softmax_cross_entropy_with_integer_labels, averaged over non-pad tokens
-        ce_loss = NotImplementedError
-        ce_loss_masked = NotImplementedError
-        total_valid = NotImplementedError
-        batch_ce_loss = NotImplementedError
+        ce_loss = optax.losses.softmax_cross_entropy_with_integer_labels(model_logits, golden)
+        ce_loss_masked = jnp.where(transcript_paddings == 0.0, ce_loss, 0.0)
+        total_valid = jnp.maximum(jnp.sum(transcript_paddings == 0.0), 1.0)
+        batch_ce_loss = jnp.sum(ce_loss_masked) / total_valid
 
         # TODO: If self.ctc_weight > 0, CTC loss with optax.losses.ctc_loss (blank_id is the tokenizer blank)
         # TODO: Joint loss = (1 - ctc_weight) * ce_loss + ctc_weight * ctc_loss. Otherwise return the CE loss.
         if self.ctc_weight > 0.0 and ctc_logits is not None:
-            logit_paddings = NotImplementedError
-            log_probs = NotImplementedError
-            ctc_loss = NotImplementedError
-            batch_ctc_loss = NotImplementedError
+            logit_paddings = self.create_loss_pad_mask(ctc_logits, feat_lens)
+            log_probs = jax.nn.log_softmax(ctc_logits, axis=-1)
+            ctc_loss = optax.losses.ctc_loss(
+                logits=log_probs,
+                logit_paddings=logit_paddings,
+                labels=golden,
+                label_paddings=transcript_paddings,
+                blank_id=self.tokenizer.blank_id
+            )
+            batch_ctc_loss = jnp.mean(ctc_loss)
             loss = (1.0 - self.ctc_weight) * batch_ce_loss + self.ctc_weight * batch_ctc_loss
         else:
             loss = batch_ce_loss
@@ -108,22 +121,16 @@ class ASRTrainer(BaseTrainer):
         optimizer: nnx.Optimizer,
         batch: Dict[str, jax.Array]
     ) -> float:
-        """
-        Performs a single forward, backward via nnx.value_and_grad, and optimizer parameter update.
-        """
-        raise NotImplementedError  # Remove once implemented
-
+        """Performs a single forward, backward via nnx.value_and_grad, and optimizer parameter update."""
         # TODO: Define loss_fn(m) that returns self.ctc_and_ce_loss(m, batch, training=True)
         def loss_fn(m):
-            return NotImplementedError
+            return self.ctc_and_ce_loss(m, batch, training=True)
 
         # TODO: loss, grads = nnx.value_and_grad(loss_fn)(model)
-        vg_fn = NotImplementedError
-        loss, grads = NotImplementedError, NotImplementedError
-
+        vg_fn = nnx.value_and_grad(loss_fn)
+        loss, grads = vg_fn(model)
         # TODO: Update parameters with optimizer.update(grads)
         optimizer.update(grads)
-
         # TODO: Return float(loss)
         return float(loss)
 
@@ -147,6 +154,7 @@ class ASRTrainer(BaseTrainer):
 
         return {'train_loss': loss_meter.avg}
 
+    # Alias for Torch parity
     _train_epoch = train_epoch
 
     def validate_epoch(
@@ -167,7 +175,30 @@ class ASRTrainer(BaseTrainer):
 
         return {'val_loss': loss_meter.avg}
 
+    # Alias for Torch parity
     _validate_epoch = validate_epoch
+
+    def train(
+        self,
+        train_loader = None,
+        val_loader = None,
+        epochs: Optional[int] = None
+    ) -> Dict[str, Any]:
+        num_epochs = epochs or self.config.get('epochs', 10)
+        history = {'train_loss': [], 'val_loss': []}
+
+        for ep in range(1, num_epochs + 1):
+            if train_loader is not None:
+                tr_metrics = self.train_epoch(dataloader=train_loader, epoch=ep)
+                history['train_loss'].append(tr_metrics['train_loss'])
+            if val_loader is not None:
+                val_metrics = self.validate_epoch(dataloader=val_loader, epoch=ep)
+                history['val_loss'].append(val_metrics['val_loss'])
+                self.log_metrics(ep, {**tr_metrics, **val_metrics})
+            elif train_loader is not None:
+                self.log_metrics(ep, tr_metrics)
+
+        return history
 
     def recognize(
         self,
@@ -178,19 +209,16 @@ class ASRTrainer(BaseTrainer):
         beam_width: int = 4
     ) -> List[str]:
         """Transcribe speech features into text transcripts."""
-        raise NotImplementedError  # Remove once implemented
-
         m = model or self.model
         m.eval()
-
         # TODO: Encode speech features with model.encode
-        enc_out, enc_lens = NotImplementedError, NotImplementedError
+        enc_out, enc_lens = m.encode(features, feature_lengths)
         batch_size = features.shape[0]
 
         # TODO: Define score_fn(seq) from decode, then take the last-step logits
         def score_fn(seq):
-            dec_out = NotImplementedError
-            logits = NotImplementedError
+            dec_out = m.decode(seq, enc_out, memory_lengths=enc_lens)
+            logits = m.final_linear(dec_out)
             return logits[:, -1, :]
 
         generator = SequenceGenerator(
@@ -200,18 +228,17 @@ class ASRTrainer(BaseTrainer):
         )
 
         # TODO: Initialize prompts as a batch of SOS tokens
-        init_prompts = NotImplementedError
-
+        init_prompts = jnp.full((batch_size, 1), self.tokenizer.sos_id, dtype=jnp.int64)
         # TODO: Generate sequences with beam search when decode_type == 'beam', otherwise greedy search
         if decode_type == 'beam':
-            beams, _ = NotImplementedError, NotImplementedError
+            beams, _ = generator.generate_beam(init_prompts, beam_width=beam_width)
             best_seqs = beams[:, 0, :]
         else:
-            best_seqs, _ = NotImplementedError, NotImplementedError
+            best_seqs, _ = generator.generate_greedy(init_prompts)
 
         # TODO: Post-process each sequence and decode it to text with the tokenizer
         transcripts = []
         for seq in best_seqs:
-            clean = NotImplementedError
-            transcripts.append(NotImplementedError)
+            clean = generator.post_process_sequence(seq, self.tokenizer)
+            transcripts.append(self.tokenizer.decode(clean.tolist(), skip_special_tokens=True))
         return transcripts

@@ -4,20 +4,13 @@ from flax import nnx
 from .sublayers import SelfAttentionLayer, FeedForwardLayer
 from .positional_encoding import RotaryPositionalEncoding
 
-'''
-TODO: Implement this Module.
-
-SelfAttentionEncoderLayer: Used in the encoder part of transformers
-- Contains self-attention and feed-forward sublayers
-- Does NOT use causal masking (bidirectional attention over speech features)
-- Pre-LN residual structure
-'''
-
 class SelfAttentionEncoderLayer(nnx.Module):
-    '''
-    Pre-LN Encoder Layer with self-attention.
-    Input -> SelfAttentionLayer -> FeedForwardLayer -> Output
-    '''
+    """
+    Self-Attention Encoder Layer for Automatic Speech Recognition in Flax NNX.
+    
+    Architecture:
+    Input -> SelfAttentionLayer (Pre-LN + MHA + Residual) -> FeedForwardLayer (Pre-LN + FFN + Residual) -> Output
+    """
     def __init__(
         self,
         d_model: int,
@@ -31,28 +24,36 @@ class SelfAttentionEncoderLayer(nnx.Module):
         *,
         rngs: Optional[nnx.Rngs] = None
     ):
-        '''
-        Initialize the SelfAttentionEncoderLayer.
-        Args:
-            d_model   (int): The dimension of the model.
-            num_heads (int): The number of attention heads.
-            d_ff      (int): The dimension of the feedforward network.
-            dropout (float): The dropout rate.
-            norm_type (str): The normalization to use, 'rmsnorm' or 'layernorm'.
-            ffn_type  (str): The feed-forward network to use, 'swiglu' or 'gelu'.
-            qk_norm  (bool): Whether to normalize the queries and keys before scoring.
-            rope (Optional[RotaryPositionalEncoding]): Rotary embeddings, or None to disable.
-        '''
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
+        
         # TODO: Implement __init__
-        raise NotImplementedError  # Remove once implemented
         # Step 1: Initialize self.self_attn as SelfAttentionLayer (no causal mask is stored here)
-        self.self_attn = NotImplementedError
+        self.self_attn = SelfAttentionLayer(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            norm_type=norm_type,
+            qk_norm=qk_norm,
+            rope=rope,
+            rngs=rngs
+        )
         # Step 2: Initialize self.ffn as FeedForwardLayer
-        self.ffn = NotImplementedError
+        self.ffn = FeedForwardLayer(
+            d_model=d_model,
+            d_ff=d_ff,
+            dropout=dropout,
+            norm_type=norm_type,
+            ffn_type=ffn_type,
+            rngs=rngs
+        )
+
+    @property
+    def feed_forward(self):
+        """Attribute alias for compatibility with test assertions."""
+        return self.ffn
 
     def __call__(
         self,
@@ -60,21 +61,22 @@ class SelfAttentionEncoderLayer(nnx.Module):
         pad_mask: Optional[jax.Array] = None,
         attn_mask: Optional[jax.Array] = None
     ) -> Tuple[jax.Array, jax.Array]:
-        '''
-        Forward pass for the encoder layer.
+        """
+        Forward pass for encoder layer.
+        
         Args:
-            x (jax.Array): Input array, shape (N, T, d_model).
-            pad_mask (Optional[jax.Array]): Padding mask, shape (N, T).
-            attn_mask (Optional[jax.Array]): Attention mask, shape (T, T).
+            x (jax.Array): Input tensor, shape (N, T, d_model).
+            pad_mask (jax.Array, optional): Padding mask, shape (N, T).
+            attn_mask (jax.Array, optional): Attention mask, shape (T, T).
+            
         Returns:
-            Tuple[jax.Array, jax.Array]: (output of shape (N, T, d_model), attn_weights of shape (N, T, T))
-        '''
+            Tuple[jax.Array, jax.Array]: (encoded_output of shape (N, T, d_model), attn_weights of shape (N, T, T))
+        """
         # TODO: Implement __call__. What differs from decoder self-attention is the missing causal mask.
-        raise NotImplementedError  # Remove once implemented
         # Step 1: Run self_attn with the padding mask and no causal mask
-        x, attn_weights = NotImplementedError, NotImplementedError
+        x, attn_weights = self.self_attn(x, pad_mask=pad_mask, attn_mask=attn_mask)
         # Step 2: Run self.ffn
-        x = NotImplementedError
+        x = self.ffn(x)
         # Step 3: Return (output, attn_weights)
         return x, attn_weights
 

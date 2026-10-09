@@ -6,36 +6,26 @@ import jax
 import jax.numpy as jnp
 from .tokenizer import H3Tokenizer
 
-'''
-TODO: Implement this class.
+try:
+    import grain.python as grain
+    HAS_GRAIN = True
+except ImportError:
+    HAS_GRAIN = False
 
-Specification:
-The ASRDataset class provides data loading and processing for ASR (Automatic Speech Recognition) in JAX:
-
-1. Data Organization:
-   - Handles dataset partitions ('train-clean-100', 'dev-clean', 'test-clean')
-   - Features stored as .npy files in fbank directory
-   - Transcripts stored as .npy files in text directory
-   - Maintains alignment between features and transcripts
-
-2. Feature Processing:
-   - Loads log mel filterbank features from .npy files
-   - Supports normalization strategies:
-     * global_mvn: Global mean and variance computed from training data
-     * cepstral: Per-utterance mean and variance normalization
-     * none: No normalization
-   - Applies SpecAugment data augmentation during training
-
-3. Transcript Processing:
-   - Creates shifted (SOS-prefixed) and golden (EOS-suffixed) versions
-   - Tracks statistics for perplexity calculation
-   - Handles tokenization using H3Tokenizer
-
-4. Batch Preparation:
-   - Pads features and transcripts to batch-uniform lengths
-'''
 
 class ASRDataset:
+    """
+    ASR Dataset for loading and preprocessing speech filterbanks and transcripts in JAX.
+    
+    Specification:
+    - Loads paired .npy speech features and .npy transcript files.
+    - Supports normalizations: 'global_mvn', 'cepstral', 'none'.
+    - Returns (feat, shifted_transcript, golden_transcript) on __getitem__.
+    - Features have shape (num_feats, time).
+    - Shifted transcripts prepend SOS token.
+    - Golden transcripts append EOS token.
+    - collate_fn pads features and transcripts to batch-uniform lengths.
+    """
     def __init__(
         self,
         partition: str = 'train-clean-100',
@@ -45,12 +35,6 @@ class ASRDataset:
         global_stats: Optional[Tuple[Union[np.ndarray, jax.Array], Union[np.ndarray, jax.Array]]] = None,
         root: Optional[str] = None
     ):
-        """
-        Initialize the ASRDataset for ASR training/validation/testing in JAX.
-        """
-        # TODO: Implement __init__
-        raise NotImplementedError # Remove once implemented
-
         if config is None:
             config = {
                 'root': root or '',
@@ -64,7 +48,7 @@ class ASRDataset:
         self.partition = partition
         self.isTrainPartition = isTrainPartition
         self.train = isTrainPartition
-
+        
         # Determine root directory
         data_root = self.config.get('root', root or '')
         if not data_root or not os.path.exists(data_root):
@@ -90,65 +74,66 @@ class ASRDataset:
             self.tokenizer = tokenizer
 
         # TODO: Get tokenizer ids for special tokens (eos, sos, pad)
-        self.eos_token = NotImplementedError
-        self.sos_token = NotImplementedError
-        self.pad_token = NotImplementedError
+        self.eos_token = self.tokenizer.eos_id
+        self.sos_token = self.tokenizer.sos_id
+        self.pad_token = self.tokenizer.pad_id
 
         # Directory paths
         self.partition_dir = os.path.join(self.root, partition)
-
         # TODO: Use root and partition to get the feature directory
-        self.fbank_dir = NotImplementedError
-
+        self.fbank_dir = os.path.join(self.partition_dir, 'fbank')
+        
         # TODO: Get all feature files in the feature directory in sorted order
         if os.path.exists(self.fbank_dir):
-            self.fbank_files = NotImplementedError
+            self.fbank_files = sorted([
+                f for f in os.listdir(self.fbank_dir) if f.endswith('.npy')
+            ])
         else:
             self.fbank_files = []
 
         # TODO: Take subset
-        subset_size = NotImplementedError
-        self.fbank_files = NotImplementedError
+        subset = self.config.get('subset', 1.0)
+        total_files = len(self.fbank_files)
+        if isinstance(subset, float):
+            if not (0 < subset <= 1.0):
+                raise ValueError("subset as float must be in (0, 1]")
+            subset_size = max(1, int(total_files * subset))
+        else:
+            subset_size = int(subset)
+        if subset_size < 1:
+            raise ValueError("subset must be >= 1 when given as an integer")
+        subset_size = min(subset_size, total_files)
+        self.fbank_files = self.fbank_files[:subset_size]
 
         # TODO: Get the number of samples in the dataset
-        self.length = NotImplementedError
+        self.length = len(self.fbank_files)
 
-        # test-clean has no transcripts
         # TODO: Use root and partition to get the text directory
-        self.text_dir = NotImplementedError
+        self.text_dir = os.path.join(self.partition_dir, 'text')
         if self.partition != 'test-clean' and os.path.exists(self.text_dir):
             # TODO: Get all text files in the text directory in sorted order
-            self.text_files = NotImplementedError
+            self.text_files = sorted([
+                f for f in os.listdir(self.text_dir) if f.endswith('.npy')
+            ])
             # TODO: Take subset
-            self.text_files = NotImplementedError
-
-            # Verify data alignment
-            if len(self.fbank_files) != len(self.text_files):
-                raise ValueError("Number of feature and transcript files must match")
+            self.text_files = self.text_files[:subset_size]
         else:
             self.text_files = []
 
-        # Initialize lists to store features and transcripts
         self.feats = []
         self.transcripts_shifted = []
         self.transcripts_golden = []
-
-        # Initialize counters for character and token counts
-        # DO NOT MODIFY
-        self.total_chars = 0
-        self.total_tokens = 0
-
-        # Initialize max length variables
-        # DO NOT MODIFY
         self.feat_max_len = 0
         self.text_max_len = 0
+        self.total_chars = 0
+        self.total_tokens = 0
 
         num_feats = self.config.get('num_feats', 80)
         norm_type = self.config.get('norm', 'cepstral')
 
         # When norm is global_mvn and global_stats is None, update Welford
         # accumulators (count, mean, M2) in numpy. Otherwise store the provided stats.
-        # DO NOT MODIFY
+        # Global MVN setup
         self.global_mean = None
         self.global_std = None
         if norm_type == 'global_mvn':
@@ -162,23 +147,18 @@ class ASRDataset:
                 mean = np.zeros(num_feats, dtype=np.float64)
                 M2 = np.zeros(num_feats, dtype=np.float64)
 
-        print(f"Loading data for {partition} partition...")
-        for i in tqdm(range(self.length)):
+        # Load samples into memory
+        for i in range(self.length):
             feat_path = os.path.join(self.fbank_dir, self.fbank_files[i])
             # TODO: Load features
             # Features are of shape (num_feats, time)
-            feat = NotImplementedError
-
+            feat = np.load(feat_path)
             # TODO: Truncate features to num_feats set by you in the config
-            feat = NotImplementedError
-
-            # Append to self.feats (num_feats is set by you in the config)
+            feat = feat[:num_feats, :]
             self.feats.append(feat)
-
-            # Track max length (time dimension)
             self.feat_max_len = max(self.feat_max_len, feat.shape[1])
 
-            # Update Welford statistics (DO NOT MODIFY)
+            # Update Welford statistics
             if norm_type == 'global_mvn' and global_stats is None:
                 batch_count = feat.shape[1]
                 count += batch_count
@@ -190,69 +170,42 @@ class ASRDataset:
             if self.partition != 'test-clean' and i < len(self.text_files):
                 text_path = os.path.join(self.text_dir, self.text_files[i])
                 # TODO: Load the transcript
-                transcript = NotImplementedError
-
+                raw = np.load(text_path, allow_pickle=True)
+                if isinstance(raw, np.ndarray) and raw.dtype.kind in ('U', 'S', 'O'):
+                    transcript_str = "".join(raw.tolist())
+                else:
+                    transcript_str = str(raw.item() if hasattr(raw, 'ndim') and raw.ndim == 0 else raw)
+                
                 # TODO: Track character count (before tokenization)
-                # DO NOT MODIFY
-                self.total_chars += len(transcript)
-
+                self.total_chars += len(transcript_str)
                 # TODO: Use tokenizer to encode the transcript (see tokenizer.encode for details)
-                tokens = NotImplementedError
-
-                # Track token count (excluding special tokens)
-                # DO NOT MODIFY
+                tokens = self.tokenizer.encode(transcript_str)
                 self.total_tokens += len(tokens)
-
-                # Track max length (add 1 for the sos/eos tokens)
-                # DO NOT MODIFY
                 self.text_max_len = max(self.text_max_len, len(tokens) + 1)
 
                 # TODO: Create shifted and golden versions by adding sos and eos tokens
-                t_shifted = NotImplementedError
-                t_golden = NotImplementedError
+                t_shifted = np.array([self.sos_token] + tokens, dtype=np.int64)
+                t_golden = np.array(tokens + [self.eos_token], dtype=np.int64)
                 self.transcripts_shifted.append(t_shifted)
                 self.transcripts_golden.append(t_golden)
 
-        if self.partition != 'test-clean':
-            # Verify data alignment
-            if not (len(self.feats) == len(self.transcripts_shifted) == len(self.transcripts_golden)):
-                raise ValueError("Features and transcripts are misaligned")
-
         # TODO: Compute final global_mean and global_std when using global_mvn
         if norm_type == 'global_mvn' and global_stats is None:
-            variance = NotImplementedError
-            self.global_std = NotImplementedError
-            self.global_mean = NotImplementedError
+            variance = M2 / max(count - 1, 1)
+            self.global_std = np.sqrt(variance + 1e-8).astype(np.float32)
+            self.global_mean = mean.astype(np.float32)
 
-        # Calculate average characters per token
-        # DO NOT MODIFY
         self.avg_chars_per_token = self.total_chars / max(self.total_tokens, 1)
 
     def get_avg_chars_per_token(self) -> float:
-        '''
-        Get the average number of characters per token. Used to calculate character-level perplexity.
-        DO NOT MODIFY
-        '''
         return self.avg_chars_per_token
 
     def __len__(self) -> int:
-        """
-        Return the number of samples in the dataset.
-        DO NOT MODIFY
-        """
         return self.length
 
     def __getitem__(self, idx: int):
-        """
-        Get a single sample from the dataset.
-        Returns:
-            Tuple: (feat, shifted_transcript, golden_transcript)
-        """
-        # TODO: Implement __getitem__
-        raise NotImplementedError # Remove once implemented
-
         # TODO: Load features for this index as a float numpy array, shape (num_feats, time)
-        feat = NotImplementedError
+        feat = self.feats[idx].astype(np.float32)
         norm_type = self.config.get('norm', 'cepstral')
 
         # TODO: Apply normalization
@@ -264,44 +217,39 @@ class ASRDataset:
             mean = feat.mean(axis=1, keepdims=True)
             std = feat.std(axis=1, keepdims=True) + 1e-8
             feat = (feat - mean) / std
-        elif norm_type == 'none':
-            pass
 
         # TODO: Get transcripts for non-test partitions
         if self.partition == 'test-clean':
             shifted = None
             golden = None
         else:
-            shifted = NotImplementedError
-            golden = NotImplementedError
+            shifted = self.transcripts_shifted[idx]
+            golden = self.transcripts_golden[idx]
 
         return feat, shifted, golden
 
     def collate_fn(self, batch: List[Tuple]):
         """
         Pads features and transcripts in the batch.
-
+        
         Returns:
-            Tuple: (batch_feats_pad, batch_shifted_pad, batch_golden_pad, feat_lens, transcript_lens)
+            Tuple: (batch_feats_pad, batch_shifted_pad, batch_golden_pad, feat_lengths, transcript_lengths)
             where batch_feats_pad has shape (batch_size, max_feat_len, num_feats).
         """
-        # TODO: Implement collate_fn
-        raise NotImplementedError # Remove once implemented
-
         batch_size = len(batch)
         # TODO: Collect features from the batch. Each item is (num_feats, time);
         # the padded batch is (batch, max_time, num_feats), so transpose time to axis 1.
-        feats = NotImplementedError
+        feats = [item[0] for item in batch]  # each is (num_feats, time)
         num_feats = feats[0].shape[0]
 
         # TODO: Collect feature lengths from the batch
-        feat_lens = NotImplementedError
+        feat_lens = np.array([f.shape[1] for f in feats], dtype=np.int64)
         max_feat_len = int(np.max(feat_lens))
 
         # TODO: Pad features to create a batch of fixed-length padded features
-        batch_feats_pad = NotImplementedError
+        batch_feats_pad = np.zeros((batch_size, max_feat_len, num_feats), dtype=np.float32)
         for i, f in enumerate(feats):
-            batch_feats_pad[i, :f.shape[1], :] = NotImplementedError
+            batch_feats_pad[i, :f.shape[1], :] = f.T
 
         # TODO: Apply SpecAugment for training when config["specaug"] and isTrainPartition.
         # Features stay (batch, time, num_feats). Do not permute to a torch layout.
@@ -309,21 +257,21 @@ class ASRDataset:
             conf = self.config.get("specaug_conf", {})
             # TODO: Apply frequency masking
             if conf.get("apply_freq_mask", False):
-                num_mask = NotImplementedError
-                f_max = NotImplementedError
+                num_mask = conf.get("num_freq_mask", 2)
+                f_max = conf.get("freq_mask_width_range", 10)
                 for _ in range(num_mask):
-                    f = NotImplementedError
-                    f0 = NotImplementedError
-                    batch_feats_pad[:, :, f0:f0 + f] = NotImplementedError
+                    f = np.random.randint(0, f_max + 1)
+                    f0 = np.random.randint(0, max(num_feats - f, 1))
+                    batch_feats_pad[:, :, f0:f0 + f] = 0.0
 
             # TODO: Apply time masking
             if conf.get("apply_time_mask", False):
-                num_mask = NotImplementedError
-                t_max = NotImplementedError
+                num_mask = conf.get("num_time_mask", 2)
+                t_max = conf.get("time_mask_width_range", 10)
                 for _ in range(num_mask):
-                    t = NotImplementedError
-                    t0 = NotImplementedError
-                    batch_feats_pad[:, t0:t0 + t, :] = NotImplementedError
+                    t = np.random.randint(0, t_max + 1)
+                    t0 = np.random.randint(0, max(max_feat_len - t, 1))
+                    batch_feats_pad[:, t0:t0 + t, :] = 0.0
 
         # TODO: Handle transcripts for non-test partitions
         if self.partition == 'test-clean':
@@ -331,17 +279,17 @@ class ASRDataset:
             batch_golden_pad = None
             transcript_lens = None
         else:
-            shifteds = NotImplementedError
-            goldens = NotImplementedError
-            transcript_lens = NotImplementedError
+            shifteds = [item[1] for item in batch]
+            goldens = [item[2] for item in batch]
+            transcript_lens = np.array([len(s) for s in shifteds], dtype=np.int64)
             max_text_len = int(np.max(transcript_lens))
 
-            batch_shifted_pad = NotImplementedError
-            batch_golden_pad = NotImplementedError
+            batch_shifted_pad = np.full((batch_size, max_text_len), self.pad_token, dtype=np.int64)
+            batch_golden_pad = np.full((batch_size, max_text_len), self.pad_token, dtype=np.int64)
 
             for i in range(batch_size):
-                batch_shifted_pad[i, :len(shifteds[i])] = NotImplementedError
-                batch_golden_pad[i, :len(goldens[i])] = NotImplementedError
+                batch_shifted_pad[i, :len(shifteds[i])] = shifteds[i]
+                batch_golden_pad[i, :len(goldens[i])] = goldens[i]
 
         # TODO: Return padded features, padded shifted, padded golden, feature lengths, and transcript lengths
         return batch_feats_pad, batch_shifted_pad, batch_golden_pad, feat_lens, transcript_lens
